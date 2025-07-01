@@ -1,6 +1,3 @@
-
-
-
 (define-constant CONTRACT_OWNER tx-sender)
 (define-constant ERR_UNAUTHORIZED (err u100))
 (define-constant ERR_INSUFFICIENT_FUNDS (err u101))
@@ -115,7 +112,7 @@
     )
 )
 
-(define-private (approve-loan (proposal-id uint))
+(define-private (approve-loan-internal (proposal-id uint))
     (let ((application (unwrap! (map-get? loan-applications proposal-id) ERR_PROPOSAL_NOT_FOUND))
           (loan-id (var-get next-loan-id))
           (amount (get requested-amount application))
@@ -199,7 +196,7 @@
     )
 )
 
-(define-private (calculate-interest-rate (borrower principal))
+(define-private (calculate-loan-interest-rate (borrower principal))
     (let ((credit-score (default-to u500 (map-get? credit-scores borrower))))
         (if (>= credit-score u800)
             u800
@@ -263,4 +260,144 @@
 
 (define-read-only (calculate-loan-due (loan-id uint))
     (calculate-total-due loan-id)
+)
+(define-constant ERR_INSUFFICIENT_INSURANCE_FUNDS (err u200))
+(define-constant ERR_NOT_INSURED (err u201))
+(define-constant ERR_ALREADY_CLAIMED (err u202))
+(define-constant INSURANCE_RATE u300)
+
+(define-data-var total-insurance-pool uint u0)
+(define-data-var insurance-claims-paid uint u0)
+
+(define-map insurance-contributors principal uint)
+(define-map insured-loans uint {
+    loan-id: uint,
+    insured-amount: uint,
+    premium-paid: uint,
+    claim-status: bool
+})
+(define-map loan-insurance-mapping uint uint)
+
+(define-public (contribute-to-insurance (amount uint))
+    (begin
+        (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (var-set total-insurance-pool (+ (var-get total-insurance-pool) amount))
+        (map-set insurance-contributors tx-sender 
+            (+ (default-to u0 (map-get? insurance-contributors tx-sender)) amount))
+        (ok amount)
+    )
+)
+
+(define-public (insure-loan (loan-id uint))
+    (let ((loan (unwrap! (get-loan-details loan-id) ERR_LOAN_NOT_FOUND))
+          (premium (/ (* (get amount loan) INSURANCE_RATE) u10000))
+          (insurance-id (var-get next-proposal-id)))
+        (asserts! (is-eq (get status loan) "active") ERR_LOAN_NOT_ACTIVE)
+        (asserts! (is-none (map-get? loan-insurance-mapping loan-id)) ERR_LOAN_ALREADY_EXISTS)
+        (try! (stx-transfer? premium tx-sender (as-contract tx-sender)))
+        (var-set total-insurance-pool (+ (var-get total-insurance-pool) premium))
+        (map-set insured-loans insurance-id {
+            loan-id: loan-id,
+            insured-amount: (get amount loan),
+            premium-paid: premium,
+            claim-status: false
+        })
+        (map-set loan-insurance-mapping loan-id insurance-id)
+        (var-set next-proposal-id (+ insurance-id u1))
+        (ok insurance-id)
+    )
+)
+
+(define-public (claim-insurance (loan-id uint))
+    (let ((insurance-id (unwrap! (map-get? loan-insurance-mapping loan-id) ERR_NOT_INSURED))
+          (insurance (unwrap! (map-get? insured-loans insurance-id) ERR_NOT_INSURED))
+          (loan (unwrap! (get-loan-details loan-id) ERR_LOAN_NOT_FOUND)))
+        (asserts! (is-eq (get status loan) "liquidated") ERR_LOAN_NOT_ACTIVE)
+        (asserts! (not (get claim-status insurance)) ERR_ALREADY_CLAIMED)
+        (asserts! (>= (var-get total-insurance-pool) (get insured-amount insurance)) ERR_INSUFFICIENT_INSURANCE_FUNDS)
+        (var-set total-insurance-pool (- (var-get total-insurance-pool) (get insured-amount insurance)))
+        (var-set insurance-claims-paid (+ (var-get insurance-claims-paid) (get insured-amount insurance)))
+        (var-set total-pool (+ (var-get total-pool) (get insured-amount insurance)))
+        (map-set insured-loans insurance-id (merge insurance {claim-status: true}))
+        (ok (get insured-amount insurance))
+    )
+)
+
+(define-read-only (get-insurance-pool-balance)
+    (var-get total-insurance-pool)
+)
+
+(define-read-only (get-insurance-contributor-balance (contributor principal))
+    (default-to u0 (map-get? insurance-contributors contributor))
+)
+
+(define-read-only (get-loan-insurance (loan-id uint))
+    (match (map-get? loan-insurance-mapping loan-id)
+        insurance-id (map-get? insured-loans insurance-id)
+        none
+    )
+)
+
+(define-read-only (calculate-insurance-premium (amount uint))
+    (/ (* amount INSURANCE_RATE) u10000)
+)
+
+(define-private (calculate-interest-rate (borrower principal))
+    (let ((base-rate u1000)  ;; 10% base rate represented as basis points
+          (credit-score (default-to u0 (map-get? credit-scores borrower))))
+        (if (> credit-score u50)
+            (- base-rate u200)  ;; Reduce rate by 2% for good credit
+            base-rate))  ;; Keep base rate for lower credit scores
+)
+
+(define-private (approve-loan (proposal-id uint))
+    (let ((application (unwrap! (map-get? loan-applications proposal-id) ERR_PROPOSAL_NOT_FOUND))
+          (loan-id (var-get next-loan-id))
+          (amount (get requested-amount application))
+          (interest-rate (calculate-interest-rate (get borrower application))))
+        (asserts! (>= (var-get total-pool) amount) ERR_INSUFFICIENT_FUNDS)
+        (try! (as-contract (stx-transfer? amount tx-sender (get borrower application))))
+        (var-set total-pool (- (var-get total-pool) amount))
+        (map-set loans loan-id {
+            borrower: (get borrower application),
+            amount: amount,
+            collateral: (get collateral-amount application),
+            interest-rate: interest-rate,
+            duration: (get duration application),
+            start-block: stacks-block-height,
+            status: "active",
+            repaid-amount: u0
+        })
+        (map-set loan-applications proposal-id (merge application {status: "approved"}))
+        (try! (update-borrower-loans (get borrower application) loan-id))
+        (var-set next-loan-id (+ loan-id u1))
+        (ok loan-id)
+    )
+)
+
+(define-public (repay-loan-v2 (loan-id uint) (amount uint))
+    (let ((loan (unwrap! (map-get? loans loan-id) ERR_LOAN_NOT_FOUND)))
+        (asserts! (is-eq tx-sender (get borrower loan)) ERR_UNAUTHORIZED)
+        (asserts! (is-eq (get status loan) "active") ERR_LOAN_NOT_ACTIVE)
+        (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (let ((new-repaid (+ (get repaid-amount loan) amount))
+              (total-due (calculate-total-due loan-id)))
+            (var-set total-pool (+ (var-get total-pool) amount))
+            (try! (update-repayment-history loan-id amount))
+            (if (>= new-repaid total-due)
+                (begin
+                    (map-set loans loan-id (merge loan {repaid-amount: new-repaid, status: "completed"}))
+                    (try! (as-contract (stx-transfer? (get collateral loan) tx-sender (get borrower loan))))
+                    (update-credit-score (get borrower loan) true)
+                    (ok new-repaid)
+                )
+                (begin 
+                    (map-set loans loan-id (merge loan {repaid-amount: new-repaid}))
+                    (ok new-repaid)
+                )
+            )
+        )
+    )
 )

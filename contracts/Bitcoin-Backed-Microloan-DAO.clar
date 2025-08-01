@@ -401,3 +401,113 @@
         )
     )
 )
+
+(define-constant ERR_NO_PERFORMANCE_DATA (err u300))
+(define-constant PERFORMANCE_WINDOW_BLOCKS u14400)
+(define-constant HIGH_RISK_THRESHOLD u300)
+(define-constant MEDIUM_RISK_THRESHOLD u600)
+
+(define-data-var total-defaults uint u0)
+(define-data-var total-completed-loans uint u0)
+
+(define-map borrower-performance principal {
+    total-borrowed: uint,
+    total-repaid: uint,
+    loans-completed: uint,
+    loans-defaulted: uint,
+    avg-repayment-time: uint,
+    last-loan-block: uint,
+    risk-score: uint,
+    performance-rating: (string-ascii 10)
+})
+
+(define-map loan-performance-data uint {
+    expected-completion-block: uint,
+    actual-completion-block: uint,
+    repayment-efficiency: uint,
+    risk-category: (string-ascii 10)
+})
+
+(define-public (update-borrower-performance (borrower principal) (loan-id uint) (completion-type (string-ascii 10)))
+    (let ((loan (unwrap! (get-loan-details loan-id) ERR_LOAN_NOT_FOUND))
+          (default-perf {total-borrowed: u0, total-repaid: u0, loans-completed: u0, loans-defaulted: u0, avg-repayment-time: u0, last-loan-block: u0, risk-score: u500, performance-rating: "unrated"})
+          (current-perf (default-to default-perf (map-get? borrower-performance borrower))))
+        (let ((new-perf (if (is-eq completion-type "completed")
+                {
+                    total-borrowed: (+ (get total-borrowed current-perf) (get amount loan)),
+                    total-repaid: (+ (get total-repaid current-perf) (get repaid-amount loan)),
+                    loans-completed: (+ (get loans-completed current-perf) u1),
+                    loans-defaulted: (get loans-defaulted current-perf),
+                    avg-repayment-time: u0,
+                    last-loan-block: stacks-block-height,
+                    risk-score: u700,
+                    performance-rating: "good"
+                }
+                {
+                    total-borrowed: (+ (get total-borrowed current-perf) (get amount loan)),
+                    total-repaid: (get total-repaid current-perf),
+                    loans-completed: (get loans-completed current-perf),
+                    loans-defaulted: (+ (get loans-defaulted current-perf) u1),
+                    avg-repayment-time: u0,
+                    last-loan-block: stacks-block-height,
+                    risk-score: u300,
+                    performance-rating: "poor"
+                })))
+            (map-set borrower-performance borrower new-perf)
+            (try! (update-loan-performance-data loan-id completion-type))
+            (ok true))))
+
+(define-private (update-loan-performance-data (loan-id uint) (completion-type (string-ascii 10)))
+    (let ((loan (unwrap! (get-loan-details loan-id) ERR_LOAN_NOT_FOUND)))
+        (let ((expected-completion (+ (get start-block loan) (get duration loan)))
+              (actual-completion stacks-block-height)
+              (efficiency (calculate-repayment-efficiency expected-completion actual-completion))
+              (risk-cat (if (is-eq completion-type "completed") "low" "high")))
+            (map-set loan-performance-data loan-id {
+                expected-completion-block: expected-completion,
+                actual-completion-block: actual-completion,
+                repayment-efficiency: efficiency,
+                risk-category: risk-cat
+            })
+            (ok true))))
+
+(define-private (calculate-borrower-risk-score (borrower principal) (stats {total-borrowed: uint, total-repaid: uint, loans-completed: uint, loans-defaulted: uint, avg-repayment-time: uint, last-loan-block: uint, risk-score: uint, performance-rating: (string-ascii 10)}))
+    (let ((total-loans (+ (get loans-completed stats) (get loans-defaulted stats)))
+          (default-rate (if (> total-loans u0) (/ (* (get loans-defaulted stats) u1000) total-loans) u0))
+          (repayment-rate (if (> (get total-borrowed stats) u0) 
+                (/ (* (get total-repaid stats) u1000) (get total-borrowed stats)) u0)))
+        (let ((base-score u1000)
+              (default-penalty (* default-rate u2))
+              (repayment-bonus (/ repayment-rate u2)))
+            (if (> (+ base-score repayment-bonus) default-penalty)
+                (- (+ base-score repayment-bonus) default-penalty)
+                u100))))
+
+(define-private (calculate-repayment-efficiency (expected uint) (actual uint))
+    (if (<= actual expected)
+        u1000
+        (if (> actual (+ expected PERFORMANCE_WINDOW_BLOCKS))
+            u0
+            (/ (* u1000 expected) actual))))
+
+(define-private (get-performance-rating (risk-score uint))
+    (if (>= risk-score u800) "excellent"
+        (if (>= risk-score MEDIUM_RISK_THRESHOLD) "good"
+            (if (>= risk-score HIGH_RISK_THRESHOLD) "fair"
+                "poor"))))
+
+(define-read-only (get-borrower-analytics (borrower principal))
+    (map-get? borrower-performance borrower))
+
+(define-read-only (get-loan-analytics (loan-id uint))
+    (map-get? loan-performance-data loan-id))
+
+(define-read-only (get-portfolio-metrics)
+    {
+        total-defaults: (var-get total-defaults),
+        total-completed: (var-get total-completed-loans),
+        success-rate: (if (> (var-get total-completed-loans) u0)
+            (/ (* (var-get total-completed-loans) u100) 
+               (+ (var-get total-completed-loans) (var-get total-defaults)))
+            u0)
+    })

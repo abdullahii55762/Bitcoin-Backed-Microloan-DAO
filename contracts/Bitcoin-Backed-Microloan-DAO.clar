@@ -11,6 +11,15 @@
 (define-constant ERR_INSUFFICIENT_COLLATERAL (err u109))
 (define-constant ERR_LOAN_OVERDUE (err u110))
 
+(define-constant ERR_NO_YIELD_TO_WITHDRAW (err u400))
+(define-constant YIELD_DISTRIBUTION_RATE u7000)
+
+(define-data-var total-yield-distributed uint u0)
+(define-data-var total-yield-pool uint u0)
+
+(define-private (min (a uint) (b uint))
+    (if (< a b) a b))
+
 (define-data-var total-pool uint u0)
 (define-data-var next-loan-id uint u1)
 (define-data-var next-proposal-id uint u1)
@@ -52,6 +61,12 @@
         (var-set total-pool (+ (var-get total-pool) amount))
         (map-set pool-contributors tx-sender 
             (+ (default-to u0 (map-get? pool-contributors tx-sender)) amount))
+        (map-set contributor-yield-data tx-sender {
+            contribution-block: stacks-block-height,
+            last-yield-calculation: stacks-block-height,
+            accumulated-yield: u0,
+            withdrawn-yield: u0
+        })
         (ok amount)
     )
 )
@@ -155,6 +170,9 @@
               (total-due (calculate-total-due loan-id)))
             (var-set total-pool (+ (var-get total-pool) amount))
             (try! (update-repayment-history loan-id amount))
+            (let ((interest-portion (if (> new-repaid (get amount loan))
+                     (min (- new-repaid (get amount loan)) (- total-due (get amount loan))) u0)))
+                (unwrap-panic (distribute-interest-yield interest-portion)))
             (if (>= new-repaid total-due)
                 (begin
                     (map-set loans loan-id (merge loan {repaid-amount: new-repaid, status: "completed"}))
@@ -510,4 +528,75 @@
             (/ (* (var-get total-completed-loans) u100) 
                (+ (var-get total-completed-loans) (var-get total-defaults)))
             u0)
+    })
+
+
+(define-map contributor-yield-data principal {
+    contribution-block: uint,
+    last-yield-calculation: uint,
+    accumulated-yield: uint,
+    withdrawn-yield: uint
+})
+
+(define-map yield-snapshots uint {
+    block-height: uint,
+    total-pool-at-snapshot: uint,
+    yield-amount: uint
+})
+
+(define-public (calculate-contributor-yield (contributor principal))
+    (let ((contrib-data (map-get? contributor-yield-data contributor))
+          (contribution-amount (default-to u0 (map-get? pool-contributors contributor))))
+        (match contrib-data
+            data (let ((time-factor (- stacks-block-height (get contribution-block data)))
+                       (pool-share (if (> (var-get total-pool) u0)
+                           (/ (* contribution-amount u10000) (var-get total-pool)) u0))
+                       (yield-earned (/ (* (var-get total-yield-pool) pool-share time-factor) u100000000)))
+                (map-set contributor-yield-data contributor
+                    (merge data {
+                        last-yield-calculation: stacks-block-height,
+                        accumulated-yield: (+ (get accumulated-yield data) yield-earned)
+                    }))
+                (ok yield-earned))
+            (ok u0))))
+
+(define-public (withdraw-yield)
+    (let ((contrib-data (unwrap! (map-get? contributor-yield-data tx-sender) ERR_UNAUTHORIZED)))
+        (unwrap-panic (calculate-contributor-yield tx-sender))
+        (let ((updated-data (unwrap! (map-get? contributor-yield-data tx-sender) ERR_UNAUTHORIZED))
+              (withdrawable (- (get accumulated-yield updated-data) (get withdrawn-yield updated-data))))
+            (asserts! (> withdrawable u0) ERR_NO_YIELD_TO_WITHDRAW)
+            (try! (as-contract (stx-transfer? withdrawable tx-sender tx-sender)))
+            (map-set contributor-yield-data tx-sender
+                (merge updated-data {withdrawn-yield: (+ (get withdrawn-yield updated-data) withdrawable)}))
+            (var-set total-yield-distributed (+ (var-get total-yield-distributed) withdrawable))
+            (ok withdrawable))))
+
+(define-private (distribute-interest-yield (interest-amount uint))
+    (let ((yield-share (/ (* interest-amount YIELD_DISTRIBUTION_RATE) u10000)))
+        (var-set total-yield-pool (+ (var-get total-yield-pool) yield-share))
+        (map-set yield-snapshots stacks-block-height {
+            block-height: stacks-block-height,
+            total-pool-at-snapshot: (var-get total-pool),
+            yield-amount: yield-share
+        })
+        (ok yield-share)))
+
+(define-read-only (get-contributor-yield-info (contributor principal))
+    (let ((contrib-data (map-get? contributor-yield-data contributor)))
+        (match contrib-data
+            data {
+                contribution-block: (get contribution-block data),
+                accumulated-yield: (get accumulated-yield data),
+                withdrawn-yield: (get withdrawn-yield data),
+                pending-yield: (- (get accumulated-yield data) (get withdrawn-yield data))
+            }
+            {contribution-block: u0, accumulated-yield: u0, withdrawn-yield: u0, pending-yield: u0})))
+
+(define-read-only (get-yield-metrics)
+    {
+        total-yield-pool: (var-get total-yield-pool),
+        total-distributed: (var-get total-yield-distributed),
+        current-apy: (if (> (var-get total-pool) u0)
+            (/ (* (var-get total-yield-pool) u10000) (var-get total-pool)) u0)
     })

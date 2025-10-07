@@ -11,6 +11,12 @@
 (define-constant ERR_INSUFFICIENT_COLLATERAL (err u109))
 (define-constant ERR_LOAN_OVERDUE (err u110))
 
+(define-constant ERR_CANNOT_DELEGATE_TO_SELF (err u111))
+(define-constant ERR_NO_ACTIVE_DELEGATION (err u112))
+
+(define-map voting-delegations principal principal)
+(define-map delegation-revoked-at principal uint)
+
 (define-constant ERR_NO_YIELD_TO_WITHDRAW (err u400))
 (define-constant YIELD_DISTRIBUTION_RATE u7000)
 
@@ -600,3 +606,68 @@
         current-apy: (if (> (var-get total-pool) u0)
             (/ (* (var-get total-yield-pool) u10000) (var-get total-pool)) u0)
     })
+
+(define-public (delegate-voting-power (delegate principal))
+    (let ((contributor-amount (default-to u0 (map-get? pool-contributors tx-sender))))
+        (asserts! (> contributor-amount u0) ERR_UNAUTHORIZED)
+        (asserts! (not (is-eq tx-sender delegate)) ERR_CANNOT_DELEGATE_TO_SELF)
+        (map-set voting-delegations tx-sender delegate)
+        (map-delete delegation-revoked-at tx-sender)
+        (ok delegate)
+    )
+)
+
+(define-public (revoke-delegation)
+    (let ((current-delegate (map-get? voting-delegations tx-sender)))
+        (asserts! (is-some current-delegate) ERR_NO_ACTIVE_DELEGATION)
+        (map-delete voting-delegations tx-sender)
+        (map-set delegation-revoked-at tx-sender stacks-block-height)
+        (ok true)
+    )
+)
+
+(define-private (calculate-effective-voting-power (voter principal) (contributors-list (list 100 principal)) (accumulated-power uint))
+    (fold check-delegation-to-voter-closure contributors-list accumulated-power)
+)
+
+(define-private (check-delegation-to-voter-closure (contributor principal) (current-power uint))
+    (let ((delegate-target (map-get? voting-delegations contributor))
+          (contribution (default-to u0 (map-get? pool-contributors contributor))))
+        (if (and (is-some delegate-target) (is-eq (unwrap-panic delegate-target) tx-sender))
+            (+ current-power contribution)
+            current-power
+        )
+    )
+)
+
+(define-private (check-delegation-to-voter (contributor principal) (current-power uint) (target-voter principal))
+    (let ((delegate-target (map-get? voting-delegations contributor))
+          (contribution (default-to u0 (map-get? pool-contributors contributor))))
+        (if (is-eq (unwrap! delegate-target current-power) target-voter)
+            (+ current-power contribution)
+            current-power
+        )
+    )
+)
+
+(define-read-only (get-delegation-target (contributor principal))
+    (map-get? voting-delegations contributor)
+)
+
+(define-read-only (get-effective-voting-power (voter principal))
+    (let ((own-contribution (default-to u0 (map-get? pool-contributors voter))))
+        own-contribution
+    )
+)
+
+(define-read-only (has-active-delegation (contributor principal))
+    (is-some (map-get? voting-delegations contributor))
+)
+
+(define-read-only (get-delegation-info (contributor principal))
+    {
+        delegated-to: (map-get? voting-delegations contributor),
+        revoked-at: (default-to u0 (map-get? delegation-revoked-at contributor)),
+        is-active: (is-some (map-get? voting-delegations contributor))
+    }
+)

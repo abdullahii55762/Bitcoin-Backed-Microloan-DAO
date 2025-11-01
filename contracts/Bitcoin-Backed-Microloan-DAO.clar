@@ -11,6 +11,18 @@
 (define-constant ERR_INSUFFICIENT_COLLATERAL (err u109))
 (define-constant ERR_LOAN_OVERDUE (err u110))
 
+(define-constant ERR_SYSTEM_PAUSED (err u500))
+(define-constant ERR_PAUSE_PROPOSAL_EXISTS (err u501))
+(define-constant ERR_INSUFFICIENT_VOTING_POWER (err u502))
+(define-constant ERR_PAUSE_PROPOSAL_NOT_FOUND (err u503))
+(define-constant PAUSE_THRESHOLD u300000)
+(define-constant RESUME_QUORUM u600000)
+
+(define-data-var system-paused bool false)
+(define-data-var pause-initiated-at uint u0)
+(define-data-var pause-reason (string-ascii 200) "")
+(define-data-var next-pause-proposal-id uint u1)
+
 (define-constant ERR_CANNOT_DELEGATE_TO_SELF (err u111))
 (define-constant ERR_NO_ACTIVE_DELEGATION (err u112))
 
@@ -670,4 +682,77 @@
         revoked-at: (default-to u0 (map-get? delegation-revoked-at contributor)),
         is-active: (is-some (map-get? voting-delegations contributor))
     }
+)
+
+(define-map pause-proposals uint {
+    proposer: principal,
+    reason: (string-ascii 200),
+    votes-for-resume: uint,
+    proposal-block: uint,
+    is-active: bool
+})
+
+(define-map pause-voters {proposal-id: uint, voter: principal} bool)
+
+(define-public (emergency-pause (reason (string-ascii 200)))
+    (let ((voting-power (get-effective-voting-power tx-sender)))
+        (asserts! (>= voting-power PAUSE_THRESHOLD) ERR_INSUFFICIENT_VOTING_POWER)
+        (asserts! (not (var-get system-paused)) ERR_PAUSE_PROPOSAL_EXISTS)
+        (var-set system-paused true)
+        (var-set pause-initiated-at stacks-block-height)
+        (var-set pause-reason reason)
+        (ok true)
+    )
+)
+
+(define-public (propose-resume)
+    (let ((proposal-id (var-get next-pause-proposal-id)))
+        (asserts! (var-get system-paused) ERR_PAUSE_PROPOSAL_NOT_FOUND)
+        (map-set pause-proposals proposal-id {
+            proposer: tx-sender,
+            reason: (var-get pause-reason),
+            votes-for-resume: u0,
+            proposal-block: stacks-block-height,
+            is-active: true
+        })
+        (var-set next-pause-proposal-id (+ proposal-id u1))
+        (ok proposal-id)
+    )
+)
+
+(define-public (vote-resume (proposal-id uint))
+    (let ((proposal (unwrap! (map-get? pause-proposals proposal-id) ERR_PAUSE_PROPOSAL_NOT_FOUND))
+          (voting-power (get-effective-voting-power tx-sender)))
+        (asserts! (var-get system-paused) ERR_PAUSE_PROPOSAL_NOT_FOUND)
+        (asserts! (> voting-power u0) ERR_INSUFFICIENT_VOTING_POWER)
+        (asserts! (is-none (map-get? pause-voters {proposal-id: proposal-id, voter: tx-sender})) ERR_ALREADY_VOTED)
+        (map-set pause-voters {proposal-id: proposal-id, voter: tx-sender} true)
+        (let ((new-votes (+ (get votes-for-resume proposal) voting-power)))
+            (map-set pause-proposals proposal-id (merge proposal {votes-for-resume: new-votes}))
+            (if (>= new-votes RESUME_QUORUM)
+                (begin
+                    (var-set system-paused false)
+                    (map-set pause-proposals proposal-id (merge proposal {is-active: false}))
+                    (ok true)
+                )
+                (ok false)
+            )
+        )
+    )
+)
+
+(define-read-only (is-system-paused)
+    (var-get system-paused)
+)
+
+(define-read-only (get-pause-details)
+    {
+        is-paused: (var-get system-paused),
+        paused-at: (var-get pause-initiated-at),
+        reason: (var-get pause-reason)
+    }
+)
+
+(define-read-only (get-resume-proposal (proposal-id uint))
+    (map-get? pause-proposals proposal-id)
 )
